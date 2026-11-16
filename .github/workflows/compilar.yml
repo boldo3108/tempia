@@ -1,0 +1,76 @@
+# Compila Tempia.exe (un solo archivo) en Windows y lo publica en "Releases" cada vez que subes un tag vX.Y.Z:
+#   1. Cambia APP_VERSION en tempia.py (ej. "1.0.1") y escribe las novedades en notas/v1.0.1.md
+#   2. git tag v1.0.1  &&  git push origin v1.0.1
+# Tempia revisa la última Release y ofrece descargar e instalar Tempia.exe automáticamente.
+name: Compilar Tempia.exe
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  compilar:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependencias
+        run: python -m pip install -r requirements.txt
+
+      - name: Poner la versión del tag
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $v = "${{ github.ref_name }}".TrimStart("v")
+          (Get-Content tempia.py -Raw -Encoding utf8) -replace 'APP_VERSION = "[^"]+"', "APP_VERSION = `"$v`"" |
+            Set-Content tempia.py -Encoding utf8 -NoNewline
+          Select-String -Path tempia.py -Pattern 'APP_VERSION = '
+
+      - name: Descargar LibreHardwareMonitor (lector de sensores)
+        shell: pwsh
+        run: ./descargar_lhm.ps1
+
+      - name: Probar que los sensores cargan
+        continue-on-error: true
+        run: python -c "import tempia; b=tempia.LHMBackend(); print('LHM ok:', b.ok, b.error); hw=b.read(); print([h['name'] for h in hw]); b.close()"
+
+      - name: Datos del .exe (versión, autor)
+        run: python herramientas/version_win.py
+
+      - name: Crear Tempia.exe
+        run: >-
+          python -m PyInstaller --noconfirm --clean --onefile --windowed --uac-admin
+          --name Tempia --icon tempia.ico --version-file version_win.txt
+          --add-data "lhm;lhm" --add-data "tempia.ico;." --add-data "tempia.png;."
+          --collect-all pythonnet --collect-all clr_loader --hidden-import pynvml
+          tempia.py
+
+      - name: Notas de la versión
+        shell: pwsh
+        run: |
+          $v = "${{ github.ref_name }}"
+          $notas = "notas\$v.md"
+          if (-not (Test-Path $notas)) { "Tempia $v" | Set-Content $notas -Encoding utf8 }
+          "NOTAS=$notas" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Tempia
+          path: dist/Tempia.exe
+
+      - name: Publicar la versión
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Tempia ${{ github.ref_name }}
+          files: dist/Tempia.exe
+          body_path: ${{ env.NOTAS }}
+          make_latest: true

@@ -1,0 +1,32 @@
+TEMPIA v1.0.0 - Monitor de temperaturas, uso y ventiladores
+=========================================================
+
+NOVEDADES
+ - Ventiladores: ver RPM y CONTROLARLOS (Automatico / Manual / Curva segun temperatura)
+     * Boton "Controlar ventiladores" en la tarjeta Ventiladores
+     * Puedes renombrar cada ventilador (clic en el nombre)
+     * Seguridad: minimo 20% (50% bombas); CPU >= 90C o GPU >= 88C -> todo al 100%
+     * Al cerrar Tempia los ventiladores vuelven a modo automatico
+ - Configuracion (boton arriba a la derecha):
+     * General: °C/°F, intervalo, alertas de temperatura
+     * Ventana principal: mostrar/ocultar secciones, graficos y barras por hilo
+     * Sensores: elegir que ventiladores y temperaturas se ven
+     * Modo mini: elegir que datos mostrar, horizontal/vertical, tamano, opacidad,
+       titulos y si queda encima de todo
+     * Diagnostico: estado de los sensores, boton Copiar y Reintentar
+ - Temperatura del CPU: avisos claros de que falta (admin / PawnIO / reinicio) y
+   respaldo aproximado por ACPI si no hay otra fuente.
+
+COMO CREAR EL .EXE
+ 1. Tener Python instalado (python.org, marcar "Add python.exe to PATH").
+ 2. Doble clic en CONSTRUIR_TEMPIA.bat y esperar.
+ 3. Queda Tempia.exe en esta carpeta.
+
+TEMPERATURA DEL CPU, PLACA MADRE Y VENTILADORES
+ Windows no deja leer esos sensores sin un driver. Tempia usa PawnIO (gratis):
+   1. Descargar e instalar desde https://pawnio.eu/
+   2. Reiniciar el PC
+   3. Abrir Tempia.exe (pide permisos de administrador: aceptar)
+ Si sigue sin aparecer: Configuracion -> Diagnostico -> Copiar, y mandar ese texto.
+
+La configuracion se guarda en %APPDATA%\Tempia\config.json
