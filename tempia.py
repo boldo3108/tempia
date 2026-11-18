@@ -31,7 +31,7 @@ except ImportError:  # pragma: no cover
     psutil = None
 
 APP_NAME = "Tempia"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 APP_AUTHOR = "Boldo3108"
 GITHUB_REPO = "boldo3108/tempia"
 GITHUB_PAGE = f"https://github.com/{GITHUB_REPO}"
@@ -878,9 +878,12 @@ def read_specs():
     """Lee los componentes con PowerShell/CIM (unos segundos)."""
     if DEMO or not IS_WIN:
         return DEMO_SPECS
-    r = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "-"],
-                       input=SPECS_PS, capture_output=True, text=True, encoding="utf-8",
-                       timeout=60, creationflags=0x08000000)
+    import base64
+    encoded = base64.b64encode(SPECS_PS.encode("utf-16-le")).decode("ascii")
+    r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                        "-EncodedCommand", encoded],
+                       capture_output=True, text=True, encoding="utf-8", errors="replace",
+                       timeout=90, creationflags=0x08000000)
     out = (r.stdout or "").strip()
     start = out.find("{")
     if start < 0:
