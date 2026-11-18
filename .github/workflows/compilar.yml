@@ -42,6 +42,10 @@ jobs:
         continue-on-error: true
         run: python -c "import tempia; b=tempia.LHMBackend(); print('LHM ok:', b.ok, b.error); hw=b.read(); print([h['name'] for h in hw]); b.close()"
 
+      - name: Probar "Mi PC" (lectura de componentes)
+        continue-on-error: true
+        run: python -c "import tempia; raw=tempia.read_specs(); sec,summ=tempia.parse_specs(raw); print(summ); [print(t, len(i)) for t,_c,i in sec]"
+
       - name: Datos del .exe (versión, autor)
         run: python herramientas/version_win.py
 

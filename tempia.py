@@ -31,7 +31,7 @@ except ImportError:  # pragma: no cover
     psutil = None
 
 APP_NAME = "Tempia"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 APP_AUTHOR = "Boldo3108"
 GITHUB_REPO = "boldo3108/tempia"
 GITHUB_PAGE = f"https://github.com/{GITHUB_REPO}"
@@ -606,6 +606,314 @@ class NVMLBackend:
                 self.nv.nvmlShutdown()
         except Exception:
             pass
+
+
+# --------------------------------------------------------------------------- #
+#  Mi PC: marca, modelo y detalles de los componentes
+# --------------------------------------------------------------------------- #
+SPECS_PS = r"""
+$ErrorActionPreference = 'SilentlyContinue'
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
+function Sel($cls, $props, $ns) {
+  if ($ns) { @(Get-CimInstance -Namespace $ns -ClassName $cls | Select-Object $props) }
+  else { @(Get-CimInstance -ClassName $cls | Select-Object $props) }
+}
+$o = [ordered]@{}
+$o.system = Sel Win32_ComputerSystem Manufacturer,Model,SystemType,TotalPhysicalMemory
+$o.os = Sel Win32_OperatingSystem Caption,Version,BuildNumber,OSArchitecture,InstallDate,LastBootUpTime
+$o.board = Sel Win32_BaseBoard Manufacturer,Product,Version
+$o.bios = Sel Win32_BIOS Manufacturer,SMBIOSBIOSVersion,ReleaseDate
+$o.cpu = Sel Win32_Processor Name,Manufacturer,NumberOfCores,NumberOfLogicalProcessors,MaxClockSpeed,L2CacheSize,L3CacheSize,SocketDesignation
+$o.ram = Sel Win32_PhysicalMemory Manufacturer,PartNumber,Capacity,Speed,ConfiguredClockSpeed,DeviceLocator,BankLabel,SMBIOSMemoryType,ConfiguredVoltage
+$o.ramarray = Sel Win32_PhysicalMemoryArray MemoryDevices,MaxCapacityEx
+$o.gpu = Sel Win32_VideoController Name,AdapterCompatibility,DriverVersion,DriverDate,CurrentHorizontalResolution,CurrentVerticalResolution,CurrentRefreshRate,AdapterRAM,PNPDeviceID
+$o.gpumem = @(Get-ItemProperty 'HKLM:\SYSTEM\ControlSet001\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}\0*' |
+  Select-Object DriverDesc,@{n='Mem';e={$_.'HardwareInformation.qwMemorySize'}})
+$o.disks = Sel MSFT_PhysicalDisk FriendlyName,MediaType,BusType,Size,HealthStatus root/Microsoft/Windows/Storage
+$o.disks2 = Sel Win32_DiskDrive Model,Size,InterfaceType
+$o.monitors = @(Get-CimInstance -Namespace root/wmi -ClassName WmiMonitorID | ForEach-Object {
+  [pscustomobject]@{
+    Manufacturer = (($_.ManufacturerName | Where-Object { $_ -ne 0 } | ForEach-Object { [char]$_ }) -join '')
+    Name = (($_.UserFriendlyName | Where-Object { $_ -ne 0 } | ForEach-Object { [char]$_ }) -join '')
+    Year = $_.YearOfManufacture } })
+$o.net = @(Get-CimInstance -ClassName Win32_NetworkAdapter -Filter 'PhysicalAdapter=True' |
+  Where-Object { $_.PNPDeviceID -notlike 'ROOT*' -and $_.PNPDeviceID -notlike 'SWD*' } |
+  Select-Object Name,Manufacturer,Speed,NetEnabled)
+$o.sound = Sel Win32_SoundDevice Name,Manufacturer
+$o | ConvertTo-Json -Depth 4 -Compress
+"""
+
+RAM_TYPES = {20: "DDR", 21: "DDR2", 24: "DDR3", 26: "DDR4", 27: "LPDDR", 28: "LPDDR2", 29: "LPDDR3",
+             30: "LPDDR4", 34: "DDR5", 35: "LPDDR5"}
+RAM_MAKERS = {"80CE": "Samsung", "CE00": "Samsung", "80AD": "SK hynix", "AD00": "SK hynix",
+              "802C": "Micron", "2C00": "Micron", "04CD": "G.Skill", "029E": "Corsair", "9E": "Corsair",
+              "0198": "Kingston", "859B": "Crucial", "04F1": "TeamGroup", "0D9B": "Crucial",
+              "02FE": "Elpida", "0443": "Ramaxel", "8551": "Qimonda", "04CB": "A-DATA", "0B": "Nanya"}
+RAM_PART_HINTS = [("CMK", "Corsair"), ("CMW", "Corsair"), ("CMH", "Corsair"), ("CMT", "Corsair"),
+                  ("CMR", "Corsair"), ("F4-", "G.Skill"), ("F5-", "G.Skill"), ("KF", "Kingston Fury"),
+                  ("KHX", "Kingston HyperX"), ("BL", "Crucial Ballistix"), ("CT", "Crucial"),
+                  ("TF", "TeamGroup"), ("TD", "TeamGroup"), ("TLZ", "TeamGroup"), ("AX4", "ADATA XPG"),
+                  ("AX5", "ADATA XPG"), ("M378", "Samsung"), ("M471", "Samsung"), ("HMA", "SK hynix"),
+                  ("PSD", "Patriot"), ("PVS", "Patriot")]
+DISK_MEDIA = {3: "HDD", 4: "SSD", 5: "SCM"}
+DISK_BUS = {1: "SCSI", 3: "ATA", 6: "Fibre Channel", 7: "USB", 8: "RAID", 10: "SAS", 11: "SATA",
+            12: "SD", 17: "NVMe"}
+
+
+def _list(x):
+    if x is None:
+        return []
+    return x if isinstance(x, list) else [x]
+
+
+def _clean(s):
+    s = str(s or "").strip()
+    return "" if s.lower() in ("", "to be filled by o.e.m.", "default string", "system manufacturer",
+                               "system product name", "none", "not applicable", "o.e.m.", "unknown") else s
+
+
+def _gb(n, dec=0):
+    try:
+        v = float(n) / 1024 ** 3
+    except Exception:
+        return ""
+    return f"{v:.{dec}f} GB" if v < 1024 else f"{v / 1024:.1f} TB"
+
+
+def _disk_size(n):
+    try:
+        v = float(n) / 1e9
+    except Exception:
+        return ""
+    return f"{v:.0f} GB" if v < 1000 else f"{v / 1000:.1f} TB"
+
+
+def _date(s):
+    if isinstance(s, dict):
+        s = s.get("value") or s.get("DateTime") or ""
+    s = str(s or "")
+    import re
+    m = re.search(r"/Date\((\d+)", s)
+    if m:
+        return time.strftime("%d-%m-%Y", time.localtime(int(m.group(1)) / 1000))
+    m = re.match(r"(\d{4})(\d{2})(\d{2})", s)
+    if m:
+        return f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
+    return s[:10]
+
+
+def ram_maker(m):
+    maker = _clean(m.get("Manufacturer"))
+    part = _clean(m.get("PartNumber"))
+    key = maker.upper().replace(" ", "")
+    if key in RAM_MAKERS:
+        maker = RAM_MAKERS[key]
+    elif key[:4] in RAM_MAKERS and all(c in "0123456789ABCDEF" for c in key):
+        maker = RAM_MAKERS[key[:4]]
+    if (not maker or all(c in "0123456789ABCDEF" for c in key)) and part:
+        for pre, name in RAM_PART_HINTS:
+            if part.upper().startswith(pre):
+                return name
+    return maker
+
+
+def parse_specs(raw, gpu_live=None):
+    """Convierte el JSON de PowerShell en secciones: [(titulo, color, [(subtitulo, [(etiqueta, valor)])])]."""
+    sec = []
+    summary = []
+    sysi = (_list(raw.get("system")) or [{}])[0]
+    osi = (_list(raw.get("os")) or [{}])[0]
+    rows = []
+    maker, model = _clean(sysi.get("Manufacturer")), _clean(sysi.get("Model"))
+    if maker or model:
+        rows.append(("Equipo", f"{maker} {model}".strip()))
+    if osi.get("Caption"):
+        rows.append(("Sistema", f"{osi.get('Caption')} {osi.get('OSArchitecture') or ''}".strip()))
+        rows.append(("Versión", f"{osi.get('Version')} (compilación {osi.get('BuildNumber')})"))
+    if osi.get("InstallDate"):
+        rows.append(("Instalado el", _date(osi.get("InstallDate"))))
+    if osi.get("LastBootUpTime"):
+        rows.append(("Encendido desde", _date(osi.get("LastBootUpTime"))))
+    if rows:
+        sec.append(("Sistema", ACCENT, [(None, rows)]))
+
+    items = []
+    for b in _list(raw.get("board")):
+        r = [("Marca", _clean(b.get("Manufacturer"))), ("Modelo", _clean(b.get("Product")))]
+        if _clean(b.get("Version")):
+            r.append(("Revisión", _clean(b.get("Version"))))
+        items.append((None, r))
+        summary.append(_clean(b.get("Product")))
+    for b in _list(raw.get("bios")):
+        items.append(("BIOS", [("Marca", _clean(b.get("Manufacturer"))),
+                               ("Versión", _clean(b.get("SMBIOSBIOSVersion"))),
+                               ("Fecha", _date(b.get("ReleaseDate")))]))
+    if items:
+        sec.append(("Placa madre", WARN_ORANGE, items))
+
+    items = []
+    for c in _list(raw.get("cpu")):
+        name = " ".join(str(c.get("Name") or "").split())
+        r = [("Modelo", name), ("Marca", _clean(c.get("Manufacturer")).replace("AuthenticAMD", "AMD")
+                                         .replace("GenuineIntel", "Intel")),
+             ("Núcleos / hilos", f"{c.get('NumberOfCores')} / {c.get('NumberOfLogicalProcessors')}")]
+        if c.get("MaxClockSpeed"):
+            r.append(("Frecuencia base", f"{c['MaxClockSpeed'] / 1000:.2f} GHz"))
+        if c.get("L2CacheSize"):
+            r.append(("Caché L2", f"{c['L2CacheSize'] / 1024:.0f} MB" if c["L2CacheSize"] >= 1024 else f"{c['L2CacheSize']} KB"))
+        if c.get("L3CacheSize"):
+            r.append(("Caché L3", f"{c['L3CacheSize'] / 1024:.0f} MB" if c["L3CacheSize"] >= 1024 else f"{c['L3CacheSize']} KB"))
+        if _clean(c.get("SocketDesignation")):
+            r.append(("Socket", _clean(c.get("SocketDesignation"))))
+        items.append((None, r))
+        summary.insert(0, name)
+    if items:
+        sec.append(("Procesador", CPU_COLOR, items))
+
+    sticks = _list(raw.get("ram"))
+    if sticks:
+        total = sum(int(m.get("Capacity") or 0) for m in sticks)
+        rtype = RAM_TYPES.get(int(sticks[0].get("SMBIOSMemoryType") or 0), "")
+        speed = sticks[0].get("ConfiguredClockSpeed") or sticks[0].get("Speed")
+        arr = (_list(raw.get("ramarray")) or [{}])[0]
+        slots = arr.get("MemoryDevices")
+        head = [("Total", f"{_gb(total)} {rtype}".strip()),
+                ("Módulos", f"{len(sticks)}" + (f" de {slots} ranuras" if slots else ""))]
+        if speed:
+            head.append(("Velocidad actual", f"{speed} MT/s"))
+        if arr.get("MaxCapacityEx"):
+            head.append(("Máximo soportado", _gb(int(arr["MaxCapacityEx"]) * 1024)))
+        items = [(None, head)]
+        for m in sticks:
+            r = [("Marca", ram_maker(m) or "—"), ("Modelo", _clean(m.get("PartNumber")) or "—"),
+                 ("Capacidad", _gb(m.get("Capacity")))]
+            sp, cs = m.get("Speed"), m.get("ConfiguredClockSpeed")
+            if sp:
+                r.append(("Velocidad", f"{sp} MT/s" + (f" (usando {cs})" if cs and cs != sp else "")))
+            if m.get("ConfiguredVoltage"):
+                r.append(("Voltaje", f"{m['ConfiguredVoltage'] / 1000:.2f} V"))
+            items.append((_clean(m.get("DeviceLocator")) or _clean(m.get("BankLabel")) or "Módulo", r))
+        sec.append(("Memoria RAM", RAM_COLOR, items))
+        summary.append(f"{_gb(total)} {rtype}" + (f" {speed} MT/s" if speed else ""))
+
+    mems = {str(g.get("DriverDesc")): g.get("Mem") for g in _list(raw.get("gpumem")) if g.get("Mem")}
+    items = []
+    for i, g in enumerate(_list(raw.get("gpu"))):
+        name = str(g.get("Name") or "")
+        if "basic display" in name.lower() or "virtual" in name.lower() and len(_list(raw.get("gpu"))) > 1:
+            continue
+        r = [("Modelo", name), ("Marca", _clean(g.get("AdapterCompatibility")))]
+        vram = None
+        if gpu_live and i == 0 and gpu_live.get("mem_total"):
+            vram = gpu_live["mem_total"]
+        elif mems.get(name):
+            vram = mems[name]
+        elif g.get("AdapterRAM"):
+            vram = g["AdapterRAM"]
+        if vram:
+            r.append(("Memoria (VRAM)", _gb(vram)))
+        if g.get("DriverVersion"):
+            r.append(("Controlador", f"{g['DriverVersion']}  ·  {_date(g.get('DriverDate'))}"))
+        if g.get("CurrentHorizontalResolution"):
+            r.append(("Pantalla", f"{g['CurrentHorizontalResolution']} × {g['CurrentVerticalResolution']}"
+                                  f" a {g.get('CurrentRefreshRate')} Hz"))
+        items.append((None, r))
+        summary.append(name)
+    if items:
+        sec.append(("Tarjeta de video", GPU_COLOR, items))
+
+    items = []
+    disks = _list(raw.get("disks"))
+    if disks:
+        for d in disks:
+            items.append((None, [("Modelo", str(d.get("FriendlyName") or "")),
+                                 ("Tipo", " ".join(x for x in (DISK_MEDIA.get(d.get("MediaType"), ""),
+                                                               DISK_BUS.get(d.get("BusType"), "")) if x) or "—"),
+                                 ("Capacidad", _disk_size(d.get("Size"))),
+                                 ("Estado", {"Healthy": "Saludable", "Warning": "Advertencia",
+                                             "Unhealthy": "Con problemas"}.get(str(d.get("HealthStatus")),
+                                                                                str(d.get("HealthStatus") or "—")))]))
+    else:
+        for d in _list(raw.get("disks2")):
+            items.append((None, [("Modelo", str(d.get("Model") or "")), ("Conexión", str(d.get("InterfaceType") or "")),
+                                 ("Capacidad", _disk_size(d.get("Size")))]))
+    if items:
+        sec.append(("Almacenamiento", DISK_COLOR, items))
+
+    items = []
+    for m in _list(raw.get("monitors")):
+        r = [("Modelo", m.get("Name") or "—"), ("Marca (código)", m.get("Manufacturer") or "—")]
+        if m.get("Year"):
+            r.append(("Fabricado", str(m["Year"])))
+        items.append((None, r))
+    if items:
+        sec.append(("Monitores", NET_UP, items))
+
+    items = []
+    for n in _list(raw.get("net")):
+        sp = n.get("Speed")
+        r = [("Adaptador", str(n.get("Name") or "")), ("Marca", _clean(n.get("Manufacturer")))]
+        if sp and n.get("NetEnabled"):
+            sp = int(sp)
+            r.append(("Velocidad", f"{sp / 1e9:g} Gbps" if sp >= 1e9 else f"{sp / 1e6:g} Mbps"))
+        r.append(("Estado", "Conectado" if n.get("NetEnabled") else "Desconectado"))
+        items.append((None, r))
+    if items:
+        sec.append(("Red", NET_DOWN, items))
+
+    items = [(None, [("Dispositivo", str(s.get("Name") or "")), ("Marca", _clean(s.get("Manufacturer")))])
+             for s in _list(raw.get("sound"))]
+    if items:
+        sec.append(("Audio", FAN_COLOR, items))
+
+    # limpiar filas vacías
+    out = []
+    for title, color, its in sec:
+        its2 = [(sub, [(k, v) for k, v in rows if str(v or "").strip()]) for sub, rows in its]
+        out.append((title, color, [x for x in its2 if x[1]]))
+    return out, [s for s in summary if s]
+
+
+def read_specs():
+    """Lee los componentes con PowerShell/CIM (unos segundos)."""
+    if DEMO or not IS_WIN:
+        return DEMO_SPECS
+    r = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "-"],
+                       input=SPECS_PS, capture_output=True, text=True, encoding="utf-8",
+                       timeout=60, creationflags=0x08000000)
+    out = (r.stdout or "").strip()
+    start = out.find("{")
+    if start < 0:
+        raise RuntimeError((r.stderr or "PowerShell no devolvió datos").strip()[:200])
+    return json.loads(out[start:])
+
+
+DEMO_SPECS = {
+    "system": {"Manufacturer": "To Be Filled By O.E.M.", "Model": "To Be Filled By O.E.M."},
+    "os": {"Caption": "Microsoft Windows 11 Pro", "Version": "10.0.26200", "BuildNumber": "26200",
+           "OSArchitecture": "64 bits", "InstallDate": "/Date(1717000000000)/", "LastBootUpTime": "/Date(1763460000000)/"},
+    "board": {"Manufacturer": "ASUSTeK COMPUTER INC.", "Product": "ROG STRIX B550-F GAMING", "Version": "Rev X.0x"},
+    "bios": {"Manufacturer": "American Megatrends Inc.", "SMBIOSBIOSVersion": "3621", "ReleaseDate": "/Date(1700000000000)/"},
+    "cpu": {"Name": "AMD Ryzen 9 5950X 16-Core Processor            ", "Manufacturer": "AuthenticAMD",
+            "NumberOfCores": 16, "NumberOfLogicalProcessors": 32, "MaxClockSpeed": 3401, "L2CacheSize": 8192,
+            "L3CacheSize": 65536, "SocketDesignation": "AM4"},
+    "ram": [{"Manufacturer": "029E", "PartNumber": "CMK16GX4M2E3200C16  ", "Capacity": 8589934592 * 2, "Speed": 3200,
+             "ConfiguredClockSpeed": 3200, "DeviceLocator": "DIMM_A2", "SMBIOSMemoryType": 26, "ConfiguredVoltage": 1350},
+            {"Manufacturer": "029E", "PartNumber": "CMK16GX4M2E3200C16  ", "Capacity": 8589934592 * 2, "Speed": 3200,
+             "ConfiguredClockSpeed": 3200, "DeviceLocator": "DIMM_B2", "SMBIOSMemoryType": 26, "ConfiguredVoltage": 1350}],
+    "ramarray": {"MemoryDevices": 4, "MaxCapacityEx": 134217728},
+    "gpu": {"Name": "NVIDIA GeForce RTX 4070 SUPER", "AdapterCompatibility": "NVIDIA", "DriverVersion": "32.0.15.8157",
+            "DriverDate": "/Date(1760000000000)/", "CurrentHorizontalResolution": 2560, "CurrentVerticalResolution": 1440,
+            "CurrentRefreshRate": 165, "AdapterRAM": 4293918720},
+    "gpumem": {"DriverDesc": "NVIDIA GeForce RTX 4070 SUPER", "Mem": 12878610432},
+    "disks": [{"FriendlyName": "Samsung SSD 980 1TB", "MediaType": 4, "BusType": 17, "Size": 1000204886016, "HealthStatus": "Healthy"},
+              {"FriendlyName": "ST1000DM010-2EP102", "MediaType": 3, "BusType": 11, "Size": 1000204886016, "HealthStatus": "Healthy"}],
+    "monitors": [{"Manufacturer": "AUS", "Name": "VG27AQ1A", "Year": 2022}],
+    "net": [{"Name": "Realtek Gaming 2.5GbE Family Controller", "Manufacturer": "Realtek", "Speed": 1000000000, "NetEnabled": True},
+            {"Name": "Intel(R) Wi-Fi 6 AX200 160MHz", "Manufacturer": "Intel Corporation", "Speed": None, "NetEnabled": False}],
+    "sound": [{"Name": "NVIDIA High Definition Audio", "Manufacturer": "NVIDIA"},
+              {"Name": "Realtek USB Audio", "Manufacturer": "Realtek"}],
+}
 
 
 def _find(sensors, stype, *names, default=None):
@@ -1329,6 +1637,7 @@ class TempiaApp:
         btns = tk.Frame(header, bg=BG)
         btns.pack(side="right")
         FlatButton(btns, "⚙  Configuración", self.open_settings, bg=CARD).pack(side="right", padx=(px(6), 0))
+        FlatButton(btns, "🖥  Mi PC", self.open_specs, bg=CARD).pack(side="right", padx=(px(6), 0))
         self.b_update = FlatButton(btns, "", lambda: self.open_settings("about"), bg="#14532d")
         self.update_info = None
         FlatButton(btns, "▣  Modo mini", self.open_mini, bg=CARD).pack(side="right", padx=(px(6), 0))
@@ -2047,6 +2356,135 @@ class TempiaApp:
                 w["err"].configure(text=("Error: " + f["error"][:60]) if f.get("error") else "")
         self.fan_emerg_lbl.configure(
             text="⚠ Temperatura alta: ventiladores controlados al 100%" if s.get("fan_emergency") else "")
+
+    # ============================================================ Mi PC
+    def open_specs(self):
+        if getattr(self, "specs_win", None) is not None:
+            self.specs_win.lift()
+            return
+        w = tk.Toplevel(self.root)
+        w.title("Tempia — Mi PC")
+        w.configure(bg=BG)
+        w.geometry(f"{px(820)}x{px(680)}")
+        w.minsize(px(560), px(400))
+        w.attributes("-topmost", bool(self.cfg.get("topmost")))
+        w.protocol("WM_DELETE_WINDOW", self.close_specs)
+        self.specs_win = w
+        head = tk.Frame(w, bg=BG)
+        head.pack(fill="x", padx=px(18), pady=(px(14), px(4)))
+        tk.Label(head, text="Mi PC", bg=BG, fg=TEXT, font=(FONT, 15, "bold")).pack(side="left")
+        bar = tk.Frame(head, bg=BG)
+        bar.pack(side="right")
+        self.specs_copy = FlatButton(bar, "📋  Copiar todo", self._copy_specs, bg=CARD)
+        self.specs_copy.pack(side="left", padx=(0, px(6)))
+        FlatButton(bar, "⟳  Actualizar", lambda: self._load_specs(force=True), bg=CARD).pack(side="left")
+        self.specs_sum = tk.Label(w, text="", bg=BG, fg=MUTED, font=(FONT, 9), anchor="w", justify="left",
+                                  wraplength=px(760))
+        self.specs_sum.pack(fill="x", padx=px(18), pady=(0, px(8)))
+        outer = tk.Frame(w, bg=BG)
+        outer.pack(fill="both", expand=True, padx=(px(18), px(4)), pady=(0, px(14)))
+        canvas = tk.Canvas(outer, bg=BG, highlightthickness=0)
+        sb = tk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        self.specs_list = tk.Frame(canvas, bg=BG)
+        wid = canvas.create_window(0, 0, window=self.specs_list, anchor="nw")
+        self.specs_list.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(wid, width=e.width - px(10)))
+
+        def wheel(e):
+            try:
+                canvas.yview_scroll(int(-e.delta / 120) if e.delta else (1 if e.num == 5 else -1), "units")
+            except tk.TclError:
+                pass
+        w.bind("<MouseWheel>", wheel)
+        w.bind("<Button-4>", wheel)
+        w.bind("<Button-5>", wheel)
+        self._load_specs()
+
+    def close_specs(self):
+        if getattr(self, "specs_win", None) is not None:
+            self.specs_win.destroy()
+            self.specs_win = None
+
+    def _load_specs(self, force=False):
+        if getattr(self, "specs_data", None) and not force:
+            self._show_specs()
+            return
+        for ch in self.specs_list.winfo_children():
+            ch.destroy()
+        self.specs_sum.configure(text="")
+        tk.Label(self.specs_list, text="Leyendo los componentes de tu PC…", bg=BG, fg=MUTED,
+                 font=(FONT, 11)).pack(anchor="w", pady=px(20))
+
+        def work():
+            try:
+                raw = read_specs()
+                err = None
+            except Exception as e:
+                raw, err = None, str(e)
+            self.root.after(0, lambda: self._specs_done(raw, err))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _specs_done(self, raw, err):
+        if getattr(self, "specs_win", None) is None:
+            return
+        if err:
+            for ch in self.specs_list.winfo_children():
+                ch.destroy()
+            tk.Label(self.specs_list, text=f"No se pudieron leer los componentes:\n{err}", bg=BG, fg=HOT_RED,
+                     font=(FONT, 10), justify="left").pack(anchor="w", pady=px(20))
+            return
+        gpu_live = ((self.last or {}).get("gpus") or [None])[0]
+        self.specs_data = parse_specs(raw, gpu_live)
+        self._show_specs()
+
+    def _show_specs(self):
+        sections, summary = self.specs_data
+        for ch in self.specs_list.winfo_children():
+            ch.destroy()
+        self.specs_sum.configure(text="  ·  ".join(summary))
+        for title, color, items in sections:
+            card = tk.Frame(self.specs_list, bg=CARD, highlightthickness=1, highlightbackground=BORDER)
+            card.pack(fill="x", pady=(0, px(10)))
+            hd = tk.Frame(card, bg=CARD)
+            hd.pack(fill="x", padx=px(14), pady=(px(10), px(4)))
+            dot = tk.Canvas(hd, width=px(10), height=px(10), bg=CARD, highlightthickness=0)
+            dot.create_oval(1, 1, px(9), px(9), fill=color, outline="")
+            dot.pack(side="left", padx=(0, px(8)))
+            tk.Label(hd, text=title, bg=CARD, fg=TEXT, font=(FONT, 11, "bold")).pack(side="left")
+            body = tk.Frame(card, bg=CARD)
+            body.pack(fill="x", padx=px(14), pady=(0, px(10)))
+            for i, (sub, rows) in enumerate(items):
+                if sub:
+                    tk.Label(body, text=sub.upper(), bg=CARD, fg=MUTED, font=(FONT, 8, "bold")).pack(
+                        anchor="w", pady=(px(8), px(2)))
+                elif i > 0:
+                    tk.Frame(body, bg=BORDER, height=1).pack(fill="x", pady=px(6))
+                for k, v in rows:
+                    r = tk.Frame(body, bg=CARD)
+                    r.pack(fill="x", pady=px(1))
+                    tk.Label(r, text=k, bg=CARD, fg=MUTED, font=(FONT, 9), width=18, anchor="w").pack(side="left")
+                    tk.Label(r, text=str(v), bg=CARD, fg=TEXT, font=(FONT, 9, "bold"), anchor="w",
+                             justify="left", wraplength=px(520)).pack(side="left", fill="x")
+
+    def _copy_specs(self):
+        if not getattr(self, "specs_data", None):
+            return
+        sections, summary = self.specs_data
+        lines = ["Mi PC (Tempia)", "  ·  ".join(summary), ""]
+        for title, _c, items in sections:
+            lines.append(f"== {title} ==")
+            for sub, rows in items:
+                if sub:
+                    lines.append(f"[{sub}]")
+                lines.extend(f"  {k}: {v}" for k, v in rows)
+            lines.append("")
+        self.root.clipboard_clear()
+        self.root.clipboard_append("\n".join(lines))
+        self.specs_copy.configure(text="✓ Copiado")
+        self.root.after(1500, lambda: self.specs_copy.configure(text="📋  Copiar todo"))
 
     # ============================================================ configuración
     def open_settings(self, tab="general"):
