@@ -6,12 +6,13 @@ Creada por **Boldo3108** (Patricio, Chile). Todo en **español**: interfaz, mens
 - Repo: https://github.com/boldo3108/tempia (público)
 - Descarga: https://github.com/boldo3108/tempia/releases/latest/download/Tempia.exe
 - Se publica en su página **boldo3108.cl** (repo `boldo3108/portafolio`, ver más abajo)
-- Versión actual: **1.1.1** (`APP_VERSION` en `tempia.py`)
+- Versión actual: **1.2.0** (`APP_VERSION` en `tempia.py`)
 
 ## El dueño
 - No es programador: aprende con IA. Explicar en simple, sin jerga, y entregar cosas listas para usar.
 - Prefiere apps **.exe de un solo archivo** (nada de webapps).
-- Su PC: Ryzen 9 5950X, 32 GB DDR4 3200, RTX 4070 SUPER 12 GB, SSD NVMe 1 TB + HDD 1 TB.
+- Su PC (leído por LHM en nov-2026): AMD Ryzen 5 3600, placa ASUS TUF GAMING B550M-PLUS (WI-FI), RTX 4070 SUPER 12 GB. PawnIO ya instalado.
+- Sin administrador, LHM devuelve 0 °C en la temp. del CPU: Tempia lo descarta y muestra el aviso de admin.
 
 ## Estructura
 | Archivo | Qué es |
@@ -19,6 +20,7 @@ Creada por **Boldo3108** (Patricio, Chile). Todo en **español**: interfaz, mens
 | `tempia.py` | Toda la app (~3000 líneas, tkinter). |
 | `requirements.txt` | psutil, nvidia-ml-py, pythonnet, pyinstaller |
 | `descargar_lhm.ps1` | Baja LibreHardwareMonitor v0.9.6 (`LibreHardwareMonitor.zip`, net472) y copia sus DLL a `lhm/` |
+| `descargar_presentmon.ps1` | Baja PresentMon 2.5.1 (Intel, MIT) a `presentmon/PresentMon.exe` (FPS del modo mini) |
 | `CONSTRUIR_TEMPIA.bat` | Compila el .exe a mano en Windows (venv + LHM + PyInstaller) |
 | `.github/workflows/compilar.yml` | Compila `Tempia.exe` en windows-latest y lo sube a la Release |
 | `herramientas/version_win.py` | Genera `version_win.txt` (datos del .exe: versión, "Creado por Boldo3108") |
@@ -26,7 +28,7 @@ Creada por **Boldo3108** (Patricio, Chile). Todo en **español**: interfaz, mens
 | `tempia.ico` / `tempia.png` | Ícono |
 | `LEEME.txt` | Instrucciones para usuarios |
 
-`lhm/`, `build/`, `dist/`, `.venv/`, `version_win.txt` y `*.spec` están en `.gitignore`.
+`lhm/`, `presentmon/`, `build/`, `dist/`, `.venv/`, `version_win.txt` y `*.spec` están en `.gitignore`.
 
 ## Cómo está armado `tempia.py`
 1. **Config**: `load_config` / `save_config` → `%APPDATA%\Tempia\config.json`. `DEFAULT_CONFIG` define todas las claves (tarjetas visibles, modo mini, ventiladores, sensores ocultos, `check_updates`…).
@@ -36,10 +38,11 @@ Creada por **Boldo3108** (Patricio, Chile). Todo en **español**: interfaz, mens
    - `NVMLBackend`: GPU NVIDIA con `pynvml` (sin admin).
    - `ACPIThermal`: respaldo aproximado vía WMI `MSAcpi_ThermalZoneTemperature`.
    - psutil: uso CPU/RAM/discos/red.
-4. **Mi PC** (`SPECS_PS`, `read_specs`, `parse_specs`): script PowerShell/CIM ejecutado con `-EncodedCommand` (¡no con `-Command -`, eso falló!) que devuelve JSON; `parse_specs` lo convierte en secciones. `ram_maker` traduce códigos JEDEC/part numbers a marcas.
-5. **`Monitor`**: hilo de lectura. `collect()` arma un "snapshot" (dict) con cpu, gpus, ram, parts, drives, net, disk_io, fans, others, warnings. `_apply_fans()` aplica Manual/Curva con seguridad (mín. 20 %, bombas 50 %, emergencia CPU≥90 °C / GPU≥88 °C → 100 %, vuelve a automático al cerrar). `diagnostics()` = texto de Configuración → Diagnóstico. `_demo()` = datos falsos.
-6. **Widgets** propios dibujados en Canvas: `Gauge`, `HBar`, `CoreBars`, `Spark`, `FlatButton`, `Segmented`, `InfoRow`. Tema oscuro (constantes `BG`, `CARD`, `ACCENT`…). `px()` escala por DPI.
-7. **`TempiaApp`**: ventana principal (tarjetas CPU, GPU, RAM, Discos, Red, Ventiladores, Otros sensores), ventanas de **Ventiladores**, **Configuración** (pestañas General, Ventana principal, Sensores, Modo mini, Diagnóstico, Acerca de), **Mi PC** y **modo mini** flotante. La UI se actualiza en `_render(snapshot)` vía `_poll()` (cola desde el hilo).
+4. **Mi PC** (`SPECS_PS`, `read_specs`, `parse_specs`, `driver_links`): se muestra DENTRO de la ventana principal (`self.content` cambia entre `self.main` y `self.specs_page`; la barra de arriba no cambia). `driver_links` arma los botones "Descargar drivers" de cada apartado. Script PowerShell/CIM ejecutado con `-EncodedCommand` (¡no con `-Command -`, eso falló!) que devuelve JSON; `parse_specs` lo convierte en secciones. `ram_maker` traduce códigos JEDEC/part numbers a marcas.
+5. **FPS** (`FPSReader`): lanza PresentMon (`--output_stdout`) solo mientras el modo mini está abierto con el elemento "fps"; cuenta cuadros por proceso en el último segundo y muestra el del programa en primer plano. Necesita admin.
+6. **`Monitor`**: hilo de lectura. `collect()` arma un "snapshot" (dict) con cpu, gpus, ram, parts, drives, net, disk_io, fans, others, warnings. `_apply_fans()` aplica Manual/Curva con seguridad (mín. 20 %, bombas 50 %, emergencia CPU≥90 °C / GPU≥88 °C → 100 %, vuelve a automático al cerrar). `diagnostics()` = texto de Configuración → Diagnóstico. `_demo()` = datos falsos.
+7. **Widgets** propios dibujados en Canvas: `Gauge`, `HBar`, `CoreBars`, `Spark`, `FlatButton`, `Segmented`, `InfoRow`. Tema oscuro (constantes `BG`, `CARD`, `ACCENT`…). `px()` escala por DPI.
+8. **`TempiaApp`**: ventana principal (tarjetas CPU, GPU, RAM, Discos, Red, Ventiladores, Otros sensores), ventanas de **Ventiladores**, **Configuración** (pestañas General, Ventana principal, Sensores, Modo mini, Diagnóstico, Acerca de), **Mi PC** y **modo mini** flotante. La UI se actualiza en `_render(snapshot)` vía `_poll()` (cola desde el hilo).
 
 ## Probar
 - En Windows: `python tempia.py` (para sensores reales: consola como administrador y `lhm/` descargado con `descargar_lhm.ps1`).
@@ -64,9 +67,10 @@ Autor de los commits: `Boldo3108 <135436320+boldo3108@users.noreply.github.com>`
 ## Cosas importantes / trampas conocidas
 - **Temperatura del CPU**: sin PawnIO (https://pawnio.eu/) no hay temp. CPU, placa madre ni ventiladores. LHM 0.9.6 ya no usa WinRing0. La app muestra el botón "Descargar PawnIO" en el aviso, en la tarjeta del CPU y en Diagnóstico.
 - El .exe se compila con `--uac-admin` (pide administrador siempre) y `--onefile`.
-- PyInstaller necesita `--collect-all pythonnet --collect-all clr_loader --hidden-import pynvml` y `--add-data "lhm;lhm"`.
+- PyInstaller necesita `--collect-all pythonnet --collect-all clr_loader --hidden-import pynvml`, `--add-data "lhm;lhm"` y `--add-data "presentmon;presentmon"`.
+- Los datos se leen cada 0,5 s fijo (`INTERVAL`); ya no hay botón de intervalo ni de °C arriba (°C/°F sigue en Configuración).
 - Las DLL de LHM se cargan desde `sys._MEIPASS/lhm` (`resource_path`).
-- **Nada se ha probado aún en el PC real del dueño** con el .exe (solo modo demo + pruebas en el Windows de GitHub). Lo primero es probarlo y arreglar lo que falle.
+- v1.2.0 se probó en el PC del dueño con `python tempia.py` (temp. CPU OK como admin). Falta probar el .exe compilado, los FPS en un juego real y la actualización automática.
 - La release v1.1.0 tiene "Mi PC" roto (se puede borrar); la buena es v1.1.1.
 
 ## Pendientes / ideas (ordenadas por prioridad)
@@ -75,7 +79,7 @@ Autor de los commits: `Boldo3108 <135436320+boldo3108@users.noreply.github.com>`
 3. Ícono en la bandeja del sistema + iniciar con Windows (necesario para que la curva de ventiladores funcione siempre).
 4. Overlay para OBS (fuente de navegador con fondo transparente) — el dueño hace stream en Twitch.
 5. Alertas (notificación de Windows / sonido) al pasar la temperatura límite.
-6. FPS en el modo mini (PresentMon o similar).
+6. ~~FPS en el modo mini~~ hecho con PresentMon (falta probarlo en el PC real).
 7. Historial de temperaturas por sesión + exportar.
 8. Curva de ventiladores editable (arrastrar puntos).
 9. Mostrar más de una GPU.

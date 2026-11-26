@@ -3,6 +3,8 @@ __pycache__/
 build/
 dist/
 lhm/
+presentmon/
+pm.csv
 *.spec
 version_win.txt
 Tempia.exe

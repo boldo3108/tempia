@@ -38,6 +38,17 @@ jobs:
         shell: pwsh
         run: ./descargar_lhm.ps1
 
+      - name: Descargar PresentMon (FPS del modo mini)
+        shell: pwsh
+        run: ./descargar_presentmon.ps1
+
+      - name: Probar PresentMon
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $p = Start-Process presentmon\PresentMon.exe -ArgumentList "--output_stdout","--no_console_stats","--stop_existing_session","--session_name","TempiaTest","--timed","3","--terminate_after_timed" -RedirectStandardOutput pm.csv -PassThru -Wait -NoNewWindow
+          Get-Content pm.csv -TotalCount 3
+
       - name: Probar que los sensores cargan
         continue-on-error: true
         run: python -c "import tempia; b=tempia.LHMBackend(); print('LHM ok:', b.ok, b.error); hw=b.read(); print([h['name'] for h in hw]); b.close()"
@@ -53,7 +64,7 @@ jobs:
         run: >-
           python -m PyInstaller --noconfirm --clean --onefile --windowed --uac-admin
           --name Tempia --icon tempia.ico --version-file version_win.txt
-          --add-data "lhm;lhm" --add-data "tempia.ico;." --add-data "tempia.png;."
+          --add-data "lhm;lhm" --add-data "presentmon;presentmon" --add-data "tempia.ico;." --add-data "tempia.png;."
           --collect-all pythonnet --collect-all clr_loader --hidden-import pynvml
           tempia.py
 

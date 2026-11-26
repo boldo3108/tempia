@@ -36,11 +36,16 @@ if errorlevel 1 (
   echo      pero sin temperatura de CPU, discos ni ventiladores.
   if not exist lhm mkdir lhm
 )
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0descargar_presentmon.ps1"
+if errorlevel 1 (
+  echo  [!] No se pudo descargar PresentMon. Tempia funcionara igual, pero sin FPS.
+  if not exist presentmon mkdir presentmon
+)
 
 echo  [4/4] Creando Tempia.exe ...
 pyinstaller --noconfirm --clean --onefile --windowed --uac-admin ^
   --name Tempia --icon tempia.ico ^
-  --add-data "lhm;lhm" --add-data "tempia.ico;." --add-data "tempia.png;." ^
+  --add-data "lhm;lhm" --add-data "presentmon;presentmon" --add-data "tempia.ico;." --add-data "tempia.png;." ^
   --collect-all pythonnet --collect-all clr_loader --hidden-import pynvml ^
   tempia.py
 if errorlevel 1 (

@@ -31,7 +31,7 @@ except ImportError:  # pragma: no cover
     psutil = None
 
 APP_NAME = "Tempia"
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.2.0"
 APP_AUTHOR = "Boldo3108"
 GITHUB_REPO = "boldo3108/tempia"
 GITHUB_PAGE = f"https://github.com/{GITHUB_REPO}"
@@ -70,7 +70,8 @@ HOT_RED = "#f87171"
 FONT = "Segoe UI" if IS_WIN else "DejaVu Sans"
 FONT_MONO = "Consolas" if IS_WIN else "DejaVu Sans Mono"
 
-HISTORY = 120
+HISTORY = 240           # puntos en los gráficos (240 × 0,5 s = 2 minutos)
+INTERVAL = 0.5          # segundos entre lecturas (fijo)
 
 # Ventiladores
 FAN_MIN = 20            # % mínimo permitido en manual/curva
@@ -87,6 +88,7 @@ SOURCE_LABEL = {"cpu": "según CPU", "gpu": "según GPU", "max": "según la más
 
 # Elementos posibles del modo mini: clave -> (título, color)
 MINI_ITEMS = [
+    ("fps", "FPS", OK_GREEN),
     ("cpu_temp", "CPU °", CPU_COLOR),
     ("cpu_use", "CPU %", CPU_COLOR),
     ("cpu_freq", "CPU GHz", CPU_COLOR),
@@ -103,6 +105,7 @@ MINI_ITEMS = [
     ("clock", "Hora", MUTED),
 ]
 MINI_ITEM_NAMES = {
+    "fps": "FPS del juego",
     "cpu_temp": "Temperatura CPU", "cpu_use": "Uso CPU", "cpu_freq": "Frecuencia CPU",
     "cpu_power": "Potencia CPU", "gpu_temp": "Temperatura GPU", "gpu_use": "Uso GPU",
     "gpu_hotspot": "Hotspot GPU", "gpu_power": "Potencia GPU", "vram": "VRAM usada",
@@ -275,7 +278,8 @@ def pawnio_status():
     state = "no instalado"
     try:
         out = subprocess.run(["sc", "query", "PawnIO"], capture_output=True, text=True,
-                             timeout=4, creationflags=0x08000000).stdout
+                             encoding="mbcs", errors="replace",
+                             timeout=4, creationflags=0x08000000).stdout or ""
         if "RUNNING" in out:
             state, installed = "instalado y en ejecución", True
         elif "STOPPED" in out:
@@ -609,6 +613,144 @@ class NVMLBackend:
 
 
 # --------------------------------------------------------------------------- #
+#  FPS de juegos (PresentMon, de Intel, licencia MIT) — solo mientras el modo mini lo muestra
+# --------------------------------------------------------------------------- #
+def foreground_pid():
+    if not IS_WIN:
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        hwnd = ctypes.windll.user32.GetForegroundWindow()
+        pid = wintypes.DWORD()
+        ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        return pid.value or None
+    except Exception:
+        return None
+
+
+class FPSReader:
+    """Lanza PresentMon en segundo plano y cuenta los cuadros por proceso en el último segundo."""
+    SESSION = "TempiaFPS"
+    IGNORE = {"dwm.exe", "tempia.exe", "python.exe", "pythonw.exe", "explorer.exe"}
+
+    def __init__(self):
+        self.proc = None
+        self.error = None
+        self.frames = {}      # pid -> deque de tiempos
+        self.names = {}       # pid -> nombre del programa
+        self.lock = threading.Lock()
+        self.last_pid = None
+        self.my_pid = os.getpid()
+
+    @staticmethod
+    def exe_path():
+        p = resource_path("presentmon", "PresentMon.exe")
+        return p if os.path.exists(p) else None
+
+    def start(self):
+        if self.proc is not None:
+            return
+        if DEMO:
+            self.error = None
+            return
+        exe = self.exe_path()
+        if not IS_WIN or not exe:
+            self.error = "falta PresentMon"
+            return
+        if not is_admin():
+            self.error = "requiere admin"
+            return
+        try:
+            self.proc = subprocess.Popen(
+                [exe, "--output_stdout", "--no_console_stats", "--stop_existing_session",
+                 "--session_name", self.SESSION],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                text=True, encoding="utf-8", errors="replace", bufsize=1, creationflags=0x08000000)
+        except Exception as e:
+            self.proc, self.error = None, str(e)[:60]
+            return
+        self.error = None
+        threading.Thread(target=self._read, args=(self.proc,), daemon=True).start()
+
+    def _read(self, proc):
+        i_app = i_pid = None
+        try:
+            for line in proc.stdout:
+                cols = line.rstrip("\r\n").split(",")
+                if i_pid is None:
+                    if "ProcessID" in cols:
+                        i_pid = cols.index("ProcessID")
+                        i_app = cols.index("Application") if "Application" in cols else None
+                    continue
+                if len(cols) <= i_pid:
+                    continue
+                try:
+                    pid = int(cols[i_pid])
+                except ValueError:
+                    continue
+                now = time.time()
+                with self.lock:
+                    d = self.frames.get(pid)
+                    if d is None:
+                        d = self.frames[pid] = deque(maxlen=2000)
+                        if i_app is not None and len(cols) > i_app:
+                            self.names[pid] = cols[i_app].lower()
+                    d.append(now)
+                    while d and d[0] < now - 2:
+                        d.popleft()
+        except Exception:
+            pass
+        if self.proc is proc and proc.poll() is not None and not self.error:
+            self.error = "PresentMon se cerró"
+
+    def fps(self):
+        """FPS del programa en primer plano (o del último juego si estás haciendo clic en Tempia)."""
+        if DEMO:
+            return random.randint(138, 165)
+        if self.proc is None:
+            return None
+        now = time.time()
+        with self.lock:
+            counts = {}
+            for pid, d in list(self.frames.items()):
+                while d and d[0] < now - 2:
+                    d.popleft()
+                if not d:
+                    self.frames.pop(pid, None)
+                    self.names.pop(pid, None)
+                    continue
+                counts[pid] = sum(1 for t in d if t >= now - 1)
+            fg = foreground_pid()
+            if fg and fg != self.my_pid and fg in counts and self.names.get(fg) not in self.IGNORE:
+                self.last_pid = fg
+            pid = self.last_pid
+            if pid in counts:
+                return counts[pid]
+            return None
+
+    def stop(self):
+        p, self.proc = self.proc, None
+        if p is not None:
+            try:
+                p.terminate()
+                p.wait(timeout=2)
+            except Exception:
+                pass
+            exe = self.exe_path()
+            if exe:
+                try:  # cierra la sesión de eventos de Windows que usa PresentMon
+                    subprocess.run([exe, "--terminate_existing_session", "--session_name", self.SESSION],
+                                   capture_output=True, timeout=5, creationflags=0x08000000)
+                except Exception:
+                    pass
+        with self.lock:
+            self.frames.clear()
+            self.names.clear()
+        self.last_pid = None
+
+
+# --------------------------------------------------------------------------- #
 #  Mi PC: marca, modelo y detalles de los componentes
 # --------------------------------------------------------------------------- #
 SPECS_PS = r"""
@@ -891,6 +1033,118 @@ def read_specs():
     return json.loads(out[start:])
 
 
+# --- Accesos directos para descargar drivers (Mi PC) ---
+URL_NVIDIA = "https://www.nvidia.com/es-la/geforce/drivers/"
+URL_AMD = "https://www.amd.com/es/support/download/drivers.html"
+URL_INTEL = "https://www.intel.com/content/www/us/en/support/detect.html"
+URL_WINUPDATE = "ms-settings:windowsupdate"
+DISK_TOOLS = [("samsung", "Samsung Magician", "https://semiconductor.samsung.com/consumer-storage/support/tools/"),
+              ("crucial", "Crucial Storage Executive", "https://www.crucial.com/support/storage-executive"),
+              ("ct", "Crucial Storage Executive", "https://www.crucial.com/support/storage-executive"),
+              ("kingston", "Kingston SSD Manager", "https://www.kingston.com/en/support/technical/ssdmanager"),
+              ("st", "Seagate SeaTools", "https://www.seagate.com/support/downloads/seatools/")]
+MONITOR_BRANDS = {"AUS": "ASUS", "SAM": "Samsung", "GSM": "LG", "DEL": "Dell", "ACR": "Acer", "AOC": "AOC",
+                  "BNQ": "BenQ", "MSI": "MSI", "HWP": "HP", "HPN": "HP", "LEN": "Lenovo", "VSC": "ViewSonic",
+                  "GBT": "Gigabyte", "PHL": "Philips", "XMI": "Xiaomi", "SNY": "Sony", "KTC": "KTC"}
+
+
+def _search(q):
+    import urllib.parse
+    return "https://www.google.com/search?q=" + urllib.parse.quote_plus(q)
+
+
+def _brand_of(text):
+    t = str(text or "").lower()
+    if "nvidia" in t or "geforce" in t:
+        return "NVIDIA"
+    if "amd" in t or "radeon" in t or "advanced micro" in t or t.startswith("ati"):
+        return "AMD"
+    if "intel" in t:
+        return "Intel"
+    if "realtek" in t:
+        return "Realtek"
+    return ""
+
+
+def driver_links(raw):
+    """Botones de "Descargar drivers" por apartado de Mi PC: {titulo: [(texto, url)]}. [] = no necesita."""
+    out = {"Sistema": [("Windows Update", URL_WINUPDATE)], "Memoria RAM": []}
+
+    def add(title, label, url):
+        lst = out.setdefault(title, [])
+        if url not in [u for _l, u in lst] and len(lst) < 3:
+            lst.append((label, url))
+
+    for b in _list(raw.get("board")):
+        maker, model = _clean(b.get("Manufacturer")), _clean(b.get("Product"))
+        if model:
+            short = maker.split()[0].replace("ASUSTeK", "ASUS").title() if maker else ""
+            short = {"Asus": "ASUS", "Msi": "MSI", "Asrock": "ASRock", "Micro-Star": "MSI"}.get(short, short)
+            add("Placa madre", "Drivers de la placa", _search(f"{short} {model} drivers soporte"))
+    for c in _list(raw.get("cpu")):
+        br = _brand_of(f"{c.get('Manufacturer')} {c.get('Name')}")
+        if br == "AMD":
+            add("Procesador", "Drivers de chipset AMD", URL_AMD)
+        elif br == "Intel":
+            add("Procesador", "Drivers Intel", URL_INTEL)
+    for g in _list(raw.get("gpu")):
+        name = str(g.get("Name") or "")
+        if "basic display" in name.lower() or "virtual" in name.lower():
+            continue
+        br = _brand_of(f"{g.get('AdapterCompatibility')} {name}")
+        url = {"NVIDIA": URL_NVIDIA, "AMD": URL_AMD, "Intel": URL_INTEL}.get(br)
+        if url:
+            add("Tarjeta de video", f"Drivers {br}", url)
+        elif name:
+            add("Tarjeta de video", "Buscar drivers", _search(f"{name} driver"))
+    disks = _list(raw.get("disks")) or _list(raw.get("disks2"))
+    for d in disks:
+        model = str(d.get("FriendlyName") or d.get("Model") or "").strip()
+        if not model:
+            continue
+        low = model.lower()
+        for key, label, url in DISK_TOOLS:
+            if low.startswith(key) or (len(key) > 3 and key in low):
+                add("Almacenamiento", label, url)
+                break
+        else:
+            add("Almacenamiento", f"Firmware {model.split()[0]}", _search(f"{model} firmware software"))
+    for m in _list(raw.get("monitors")):
+        brand = MONITOR_BRANDS.get(str(m.get("Manufacturer") or "").upper(), m.get("Manufacturer") or "")
+        if m.get("Name"):
+            add("Monitores", f"Driver {brand} {m['Name']}".replace("  ", " "),
+                _search(f"{brand} {m['Name']} driver"))
+    for n in _list(raw.get("net")):
+        name = str(n.get("Name") or "")
+        br = _brand_of(f"{n.get('Manufacturer')} {name}")
+        if br == "Intel":
+            add("Red", "Drivers Intel", URL_INTEL)
+        elif name:
+            add("Red", f"Drivers {br or name.split()[0]}", _search(f"{name} driver"))
+    for s in _list(raw.get("sound")):
+        name = str(s.get("Name") or "")
+        if "virtual" in name.lower() or "steam" in name.lower():
+            continue
+        br = _brand_of(f"{s.get('Manufacturer')} {name}")
+        if br == "NVIDIA":
+            add("Audio", "Viene con el driver NVIDIA", URL_NVIDIA)
+        elif br == "AMD":
+            add("Audio", "Viene con el driver AMD", URL_AMD)
+        elif name:
+            add("Audio", f"Drivers {br or name.split()[0]}", _search(f"{name} driver"))
+    return out
+
+
+def open_link(url):
+    try:
+        if url.startswith("ms-settings:") and IS_WIN:
+            os.startfile(url)
+        else:
+            webbrowser.open(url)
+    except Exception:
+        pass
+
+
 DEMO_SPECS = {
     "system": {"Manufacturer": "To Be Filled By O.E.M.", "Model": "To Be Filled By O.E.M."},
     "os": {"Caption": "Microsoft Windows 11 Pro", "Version": "10.0.26200", "BuildNumber": "26200",
@@ -1033,7 +1287,9 @@ class Monitor:
                 pass
         lhm_cpu = [h for h in lhm_hw if h["type"] == "Cpu"]
         if lhm_cpu:
-            s = [x for h in lhm_cpu for x in h["sensors"]]
+            # sin admin/PawnIO, LHM entrega 0 °C en vez de "sin dato": eso no es una lectura real
+            s = [x for h in lhm_cpu for x in h["sensors"]
+                 if not (x[0] == "Temperature" and (x[2] is None or x[2] <= 1))]
             cpu["name"] = lhm_cpu[0]["name"] or cpu["name"]
             cpu["temp"] = _find(s, "Temperature", "Core (Tctl/Tdie)", "CPU Package",
                                 "Tctl/Tdie", "Package", "Tdie", "Tctl", "Core Average", "Core Max")
@@ -1611,6 +1867,7 @@ class TempiaApp:
         self.q = queue.Queue(maxsize=2)
         self.running = True
         self.mini = None
+        self.fps_reader = None
         self.fan_win = None
         self.settings_win = None
         self.last = None
@@ -1640,17 +1897,14 @@ class TempiaApp:
         btns = tk.Frame(header, bg=BG)
         btns.pack(side="right")
         FlatButton(btns, "⚙  Configuración", self.open_settings, bg=CARD).pack(side="right", padx=(px(6), 0))
-        FlatButton(btns, "🖥  Mi PC", self.open_specs, bg=CARD).pack(side="right", padx=(px(6), 0))
+        self.b_specs = FlatButton(btns, "🖥  Mi PC", self.open_specs, bg=CARD)
+        self.b_specs.pack(side="right", padx=(px(6), 0))
         self.b_update = FlatButton(btns, "", lambda: self.open_settings("about"), bg="#14532d")
         self.update_info = None
         FlatButton(btns, "▣  Modo mini", self.open_mini, bg=CARD).pack(side="right", padx=(px(6), 0))
         self.b_top = FlatButton(btns, "📌  Siempre visible", self.toggle_top,
                                 active=bool(self.cfg.get("topmost")), bg=CARD)
         self.b_top.pack(side="right", padx=(px(6), 0))
-        self.b_unit = FlatButton(btns, "", self.toggle_unit, bg=CARD)
-        self.b_unit.pack(side="right", padx=(px(6), 0))
-        self.b_int = FlatButton(btns, "", self.cycle_interval, bg=CARD)
-        self.b_int.pack(side="right", padx=(px(6), 0))
         self._refresh_buttons()
 
         self.banner = tk.Frame(r, bg="#3b2a12", highlightthickness=1, highlightbackground="#7c5216")
@@ -1666,8 +1920,13 @@ class TempiaApp:
         self.banner_shown = False
         self.banner_kind = None
 
-        self.main = tk.Frame(r, bg=BG)
+        # "content" contiene la vista principal (tarjetas) o la vista "Mi PC"; la barra de arriba no cambia.
+        self.content = tk.Frame(r, bg=BG)
+        self.content.pack(fill="both", expand=True)
+        self.main = tk.Frame(self.content, bg=BG)
         self.main.pack(fill="both", expand=True, padx=px(18), pady=(px(4), px(16)))
+        self.specs_page = None
+        self.specs_shown = False
         self.top = tk.Frame(self.main, bg=BG)
         self.bottom = tk.Frame(self.main, bg=BG)
 
@@ -1857,26 +2116,11 @@ class TempiaApp:
 
     # ================================================================ acciones
     def _refresh_buttons(self):
-        self.b_unit.configure(text="°F" if self.cfg["fahrenheit"] else "°C")
-        self.b_int.configure(text=f"⟳  {self.cfg['interval']:g} s")
         self.b_top.set_active(bool(self.cfg.get("topmost")))
 
     def toggle_top(self):
         self.cfg["topmost"] = not self.cfg.get("topmost")
         self.root.attributes("-topmost", self.cfg["topmost"])
-        self._refresh_buttons()
-        save_config(self.cfg)
-
-    def toggle_unit(self):
-        self.cfg["fahrenheit"] = not self.cfg["fahrenheit"]
-        self._refresh_buttons()
-        save_config(self.cfg)
-        self._rerender()
-
-    def cycle_interval(self):
-        opts = [0.5, 1.0, 2.0, 5.0]
-        cur = self.cfg["interval"]
-        self.cfg["interval"] = opts[(opts.index(cur) + 1) % len(opts)] if cur in opts else 1.0
         self._refresh_buttons()
         save_config(self.cfg)
 
@@ -1917,7 +2161,7 @@ class TempiaApp:
                     self.q.put_nowait(snap)
             except Exception as e:  # pragma: no cover
                 print("Error leyendo sensores:", e)
-            end = time.time() + max(0.05, self.cfg["interval"] - (time.time() - t0))
+            end = time.time() + max(0.05, INTERVAL - (time.time() - t0))
             while self.running and time.time() < end and not self.monitor.reinit_requested:
                 time.sleep(0.05)
         try:
@@ -1959,7 +2203,7 @@ class TempiaApp:
 
         warns = s.get("warnings") or []
         if warns and not self.banner_shown:
-            self.banner.pack(fill="x", padx=px(18), pady=(0, px(6)), before=self.main)
+            self.banner.pack(fill="x", padx=px(18), pady=(0, px(6)), before=self.content)
             self.banner_shown = True
         elif not warns and self.banner_shown:
             self.banner.pack_forget()
@@ -2361,28 +2605,21 @@ class TempiaApp:
             text="⚠ Temperatura alta: ventiladores controlados al 100%" if s.get("fan_emergency") else "")
 
     # ============================================================ Mi PC
-    def open_specs(self):
-        if getattr(self, "specs_win", None) is not None:
-            self.specs_win.lift()
-            return
-        w = tk.Toplevel(self.root)
-        w.title("Tempia — Mi PC")
-        w.configure(bg=BG)
-        w.geometry(f"{px(820)}x{px(680)}")
-        w.minsize(px(560), px(400))
-        w.attributes("-topmost", bool(self.cfg.get("topmost")))
-        w.protocol("WM_DELETE_WINDOW", self.close_specs)
-        self.specs_win = w
+    def _build_specs_page(self):
+        """Vista "Mi PC" dentro de la ventana principal (la barra de arriba se mantiene)."""
+        w = tk.Frame(self.content, bg=BG)
+        self.specs_page = w
         head = tk.Frame(w, bg=BG)
-        head.pack(fill="x", padx=px(18), pady=(px(14), px(4)))
+        head.pack(fill="x", padx=px(18), pady=(px(4), px(4)))
+        FlatButton(head, "←  Volver", self.close_specs, bg=CARD).pack(side="left", padx=(0, px(12)))
         tk.Label(head, text="Mi PC", bg=BG, fg=TEXT, font=(FONT, 15, "bold")).pack(side="left")
         bar = tk.Frame(head, bg=BG)
         bar.pack(side="right")
         self.specs_copy = FlatButton(bar, "📋  Copiar todo", self._copy_specs, bg=CARD)
         self.specs_copy.pack(side="left", padx=(0, px(6)))
-        FlatButton(bar, "⟳  Actualizar", lambda: self._load_specs(force=True), bg=CARD).pack(side="left")
+        FlatButton(bar, "⟳  Volver a leer", lambda: self._load_specs(force=True), bg=CARD).pack(side="left")
         self.specs_sum = tk.Label(w, text="", bg=BG, fg=MUTED, font=(FONT, 9), anchor="w", justify="left",
-                                  wraplength=px(760))
+                                  wraplength=px(1000))
         self.specs_sum.pack(fill="x", padx=px(18), pady=(0, px(8)))
         outer = tk.Frame(w, bg=BG)
         outer.pack(fill="both", expand=True, padx=(px(18), px(4)), pady=(0, px(14)))
@@ -2397,19 +2634,36 @@ class TempiaApp:
         canvas.bind("<Configure>", lambda e: canvas.itemconfigure(wid, width=e.width - px(10)))
 
         def wheel(e):
+            if not self.specs_shown:
+                return
             try:
                 canvas.yview_scroll(int(-e.delta / 120) if e.delta else (1 if e.num == 5 else -1), "units")
             except tk.TclError:
                 pass
-        w.bind("<MouseWheel>", wheel)
-        w.bind("<Button-4>", wheel)
-        w.bind("<Button-5>", wheel)
+        self.root.bind("<MouseWheel>", wheel)
+        self.root.bind("<Button-4>", wheel)
+        self.root.bind("<Button-5>", wheel)
+
+    def open_specs(self):
+        if self.specs_shown:          # el botón funciona como interruptor
+            self.close_specs()
+            return
+        first = self.specs_page is None
+        if first:
+            self._build_specs_page()
+        self.main.pack_forget()
+        self.specs_page.pack(fill="both", expand=True)
+        self.specs_shown = True
+        self.b_specs.set_active(True)
         self._load_specs()
 
     def close_specs(self):
-        if getattr(self, "specs_win", None) is not None:
-            self.specs_win.destroy()
-            self.specs_win = None
+        if not self.specs_shown:
+            return
+        self.specs_page.pack_forget()
+        self.main.pack(fill="both", expand=True, padx=px(18), pady=(px(4), px(16)))
+        self.specs_shown = False
+        self.b_specs.set_active(False)
 
     def _load_specs(self, force=False):
         if getattr(self, "specs_data", None) and not force:
@@ -2431,7 +2685,7 @@ class TempiaApp:
         threading.Thread(target=work, daemon=True).start()
 
     def _specs_done(self, raw, err):
-        if getattr(self, "specs_win", None) is None:
+        if self.specs_page is None:
             return
         if err:
             for ch in self.specs_list.winfo_children():
@@ -2441,10 +2695,12 @@ class TempiaApp:
             return
         gpu_live = ((self.last or {}).get("gpus") or [None])[0]
         self.specs_data = parse_specs(raw, gpu_live)
+        self.specs_links = driver_links(raw)
         self._show_specs()
 
     def _show_specs(self):
         sections, summary = self.specs_data
+        links = getattr(self, "specs_links", {}) or {}
         for ch in self.specs_list.winfo_children():
             ch.destroy()
         self.specs_sum.configure(text="  ·  ".join(summary))
@@ -2457,6 +2713,15 @@ class TempiaApp:
             dot.create_oval(1, 1, px(9), px(9), fill=color, outline="")
             dot.pack(side="left", padx=(0, px(8)))
             tk.Label(hd, text=title, bg=CARD, fg=TEXT, font=(FONT, 11, "bold")).pack(side="left")
+            sec_links = links.get(title)
+            if sec_links is None:
+                pass
+            elif not sec_links:
+                tk.Label(hd, text="No necesita drivers", bg=CARD, fg=DIM, font=(FONT, 9)).pack(side="right")
+            else:
+                for label, url in reversed(sec_links):
+                    FlatButton(hd, f"⬇  {label}", lambda u=url: open_link(u), bg="#14532d",
+                               font_size=8, padx=10, pady=3).pack(side="right", padx=(px(6), 0))
             body = tk.Frame(card, bg=CARD)
             body.pack(fill="x", padx=px(14), pady=(0, px(10)))
             for i, (sub, rows) in enumerate(items):
@@ -2553,17 +2818,12 @@ class TempiaApp:
         self._rerender()
 
     def _tab_general(self, p):
-        box = self._section(p, "Unidades y actualización")
+        box = self._section(p, "Unidades", "Los datos se actualizan cada 0,5 segundos.")
         r = tk.Frame(box, bg=CARD)
         r.pack(fill="x", pady=px(3))
         tk.Label(r, text="Temperatura en", bg=CARD, fg=TEXT, font=(FONT, 10), width=18, anchor="w").pack(side="left")
         Segmented(r, [(False, "°C Celsius"), (True, "°F Fahrenheit")], self.cfg["fahrenheit"],
-                  lambda v: (self._set("fahrenheit", v), self._refresh_buttons())).pack(side="left")
-        r = tk.Frame(box, bg=CARD)
-        r.pack(fill="x", pady=px(3))
-        tk.Label(r, text="Actualizar cada", bg=CARD, fg=TEXT, font=(FONT, 10), width=18, anchor="w").pack(side="left")
-        Segmented(r, [(0.5, "0,5 s"), (1.0, "1 s"), (2.0, "2 s"), (5.0, "5 s")], self.cfg["interval"],
-                  lambda v: (self._set("interval", v), self._refresh_buttons())).pack(side="left")
+                  lambda v: self._set("fahrenheit", v)).pack(side="left")
 
         box = self._section(p, "Alertas de temperatura",
                             "Desde este valor el número se pone rojo (y naranja/amarillo un poco antes).")
@@ -2672,6 +2932,10 @@ class TempiaApp:
                 upd("items", items)
             make_check(grid, MINI_ITEM_NAMES[key], key in m["items"], cb).grid(
                 row=i // 2, column=i % 2, sticky="w", padx=(0, px(30)), pady=px(1))
+        tk.Label(box, text="FPS: muestra los cuadros por segundo del juego que tengas en primer plano. "
+                           "Solo se mide mientras el modo mini está abierto (en juegos en pantalla completa "
+                           "exclusiva el modo mini puede quedar tapado: usa «ventana sin bordes»).",
+                 bg=CARD, fg=DIM, font=(FONT, 8), justify="left", wraplength=px(520)).pack(anchor="w", pady=(px(6), 0))
 
         box = self._section(p, "Apariencia")
         rows = [("Orientación", "orientation", [("horizontal", "Horizontal"), ("vertical", "Vertical")]),
@@ -2764,7 +3028,8 @@ class TempiaApp:
             l = tk.Label(lk, text=text, bg=CARD, fg=ACCENT, font=(FONT, 10, "underline"), cursor="hand2")
             l.pack(side="left", padx=(0, px(18)))
             l.bind("<Button-1>", lambda e, u=url: webbrowser.open(u))
-        tk.Label(box, text="Sensores: LibreHardwareMonitor (MPL-2.0), NVIDIA NVML, psutil. Driver: PawnIO.",
+        tk.Label(box, text="Sensores: LibreHardwareMonitor (MPL-2.0), NVIDIA NVML, psutil. Driver: PawnIO. "
+                           "FPS: PresentMon de Intel (MIT).",
                  bg=CARD, fg=DIM, font=(FONT, 8)).pack(anchor="w", pady=(px(8), 0))
 
         box = self._section(p, "Actualizaciones", "Las versiones nuevas se publican en GitHub.")
@@ -2937,6 +3202,7 @@ class TempiaApp:
         pos = mc.get("pos")
         m.geometry(pos if pos else f"+{self.root.winfo_screenwidth() - px(420)}+{px(40)}")
         self.mini = m
+        self._sync_fps()
         if not keep_main:
             self.root.withdraw()
         if self.last:
@@ -2949,9 +3215,30 @@ class TempiaApp:
         save_config(self.cfg)
         self.mini.destroy()
         self.mini = None
+        self._sync_fps()
         self.root.deiconify()
 
+    def _sync_fps(self):
+        """PresentMon corre solo mientras el modo mini está abierto y muestra FPS."""
+        want = self.mini is not None and "fps" in (self.cfg["mini"]["items"] or [])
+        if want and self.fps_reader is None:
+            self.fps_reader = FPSReader()
+            self.fps_reader.start()
+        elif not want and self.fps_reader is not None:
+            r, self.fps_reader = self.fps_reader, None
+            threading.Thread(target=r.stop, daemon=True).start()
+
     def _mini_value(self, key, s):
+        if key == "fps":
+            r = self.fps_reader
+            if r is None:
+                return "—", DIM
+            if r.error:
+                return r.error, DIM
+            v = r.fps()
+            if v is None:
+                return "—", DIM
+            return f"{v}", (OK_GREEN if v >= 60 else WARN_YELLOW if v >= 30 else HOT_RED)
         c = s["cpu"]
         g = (s.get("gpus") or [{}])[0]
         ram = s.get("ram") or {}
@@ -3009,6 +3296,9 @@ class TempiaApp:
         if self.mini is not None:
             self.cfg["mini"]["pos"] = f"+{self.mini.winfo_x()}+{self.mini.winfo_y()}"
         save_config(self.cfg)
+        if self.fps_reader is not None:
+            self.fps_reader.stop()
+            self.fps_reader = None
         self.running = False  # el hilo devuelve los ventiladores a automático y cierra sensores
         self.root.destroy()
 
